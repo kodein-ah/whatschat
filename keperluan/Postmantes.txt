@@ -1,0 +1,6 @@
+curl -X POST http://127.0.0.1:8000/api/auth/phone/request-otp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone_number": "081234567890",
+    "email": "testuser@gmail.com"
+  }'

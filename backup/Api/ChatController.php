@@ -1,0 +1,216 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Message;
+use App\Models\Conversation;
+use App\Models\User;
+use App\Events\MessageSent;
+use App\Events\MessageStatusUpdated;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
+
+class ChatController extends Controller 
+{
+    /**
+     * Tampilkan daftar percakapan user yang sedang login
+     */
+    public function listConversations(Request $request) 
+    {
+        $userId = $request->user()->id;
+
+        $conversations = $request->user()->conversations()
+            ->with(['users', 'messages' => fn($q) => $q->latest()->take(1)])
+            ->get()
+            ->map(function ($conversation) use ($userId) {
+                // Cari siapa lawan bicaranya (partner)
+                $partner = $conversation->users->where('id', '!=', $userId)->first();
+                
+                return [
+                    'id' => (string) $conversation->id,
+                    'is_group' => (bool) $conversation->is_group,
+                    'name' => $conversation->is_group ? ($conversation->name ?? 'Grup') : ($partner->name ?? 'User'),
+                    'avatar' => $conversation->is_group ? $conversation->avatar : ($partner->avatar ?? null),
+                    'participants' => $conversation->users->map(fn($u) => [
+                        'id' => (string)$u->id, 
+                        'name' => $u->name, 
+                        'avatar' => $u->avatar, 
+                        'online' => true
+                    ])->toArray(),
+                    'last_message' => $conversation->messages->first() ? [
+                        'id' => (string) $conversation->messages->first()->id,
+                        'body' => $conversation->messages->first()->body,
+                        'sender_id' => (string) $conversation->messages->first()->sender_id,
+                        'created_at' => $conversation->messages->first()->created_at->toISOString(),
+                        'status' => $conversation->messages->first()->status,
+                    ] : null,
+                    'unread_count' => $conversation->messages()
+                                        ->where('sender_id', '!=', $userId)
+                                        ->where('status', '!=', 'read')
+                                        ->count(),
+                    'updated_at' => $conversation->updated_at->toISOString(),
+                ];
+            });
+
+        return response()->json($conversations->values()->all());
+    }
+
+    /**
+     * Mulai percakapan baru - FIXED untuk handle user_id correctly
+     * 
+     * POST /api/conversations/start
+     * Body: { "user_id": 5 }
+     */
+    public function startChat(Request $request) 
+    {
+        // ✅ VALIDATION: Pastikan user_id ada dan valid
+        $validated = $request->validate([
+            'user_id' => 'required|integer|exists:users,id',
+        ]);
+
+        $currentUserId = $request->user()->id;
+        $targetUserId = $validated['user_id'];
+
+        // ✅ SECURITY: Pastikan tidak membuat chat dengan diri sendiri
+        if ($currentUserId == $targetUserId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Tidak bisa membuat chat dengan diri sendiri'
+            ], 422);
+        }
+
+        // ✅ CEK: Apakah conversation sudah ada?
+        $conversation = Conversation::where('is_group', false)
+            ->whereHas('users', fn($q) => $q->where('user_id', $currentUserId))
+            ->whereHas('users', fn($q) => $q->where('user_id', $targetUserId))
+            ->with('users')
+            ->first();
+
+        // ✅ JIKA BELUM ADA: Buat conversation baru
+        if (!$conversation) {
+            $conversation = Conversation::create([
+                'is_group' => false, 
+                'name' => null
+            ]);
+            $conversation->users()->attach([$currentUserId, $targetUserId]);
+            $conversation->load('users');
+        }
+
+        // ✅ CEK: Target user ada dan valid
+        $targetUser = User::find($targetUserId);
+        if (!$targetUser) {
+            return response()->json([
+                'success' => false,
+                'message' => 'User tidak ditemukan'
+            ], 404);
+        }
+
+        // ✅ FORMAT: Response dengan data lengkap
+        return response()->json([
+            'id' => (string) $conversation->id,
+            'is_group' => (bool) $conversation->is_group,
+            'name' => $targetUser->name ?? 'Chat',
+            'avatar' => $targetUser->avatar,
+            'participants' => $conversation->users->map(fn($u) => [
+                'id' => (string)$u->id, 
+                'name' => $u->name, 
+                'avatar' => $u->avatar, 
+                'online' => (bool)$u->online
+            ])->toArray(),
+            'last_message' => null,
+            'unread_count' => 0,
+            'updated_at' => $conversation->updated_at->toISOString(),
+        ], 201);
+    }
+
+    /**
+     * Ambil riwayat pesan
+     */
+    public function index($conversationId) 
+    {
+        $messages = Message::where('conversation_id', $conversationId)
+            ->orderBy('created_at', 'asc')
+            ->get();
+
+        return response()->json($messages->map(fn($m) => [
+            'id' => (string)$m->id, 
+            'conversation_id' => (string)$m->conversation_id, 
+            'sender_id' => (string)$m->sender_id,
+            'type' => $m->type, 
+            'body' => $m->body ?? '', 
+            'attachment' => $m->attachment_url ? [
+                'url' => $m->attachment_url,
+                'name' => $m->attachment_name,
+                'size' => $m->attachment_size,
+                'mime' => $m->attachment_mime
+            ] : null,
+            'created_at' => $m->created_at->toISOString(), 
+            'status' => $m->status
+        ])->values()->all());
+    }
+
+    /**
+     * Simpan pesan baru
+     */
+    public function store(Request $request, $conversationId) 
+    {
+        $data = $request->validate([
+            'type' => 'required|in:text,image,file,voice',
+            'body' => 'nullable|string',
+            'attachment_url' => 'nullable|string',
+            'attachment_name' => 'nullable|string',
+            'attachment_size' => 'nullable|integer',
+            'attachment_mime' => 'nullable|string',
+        ]);
+
+        $message = Message::create([
+            'conversation_id' => $conversationId,
+            'sender_id'       => $request->user()->id,
+            'type'            => $data['type'],
+            'body'            => $data['body'] ?? '',
+            'attachment_url'  => $data['attachment_url'],
+            'attachment_name' => $data['attachment_name'],
+            'attachment_size' => $data['attachment_size'],
+            'attachment_mime' => $data['attachment_mime'],
+            'status'          => 'sent'
+        ]);
+
+        // Format data untuk dikirim ke WebSocket (Echo)
+        $formatted = [
+            'id' => (string)$message->id, 
+            'conversation_id' => (string)$message->conversation_id,
+            'sender_id' => (string)$message->sender_id, 
+            'type' => $message->type,
+            'body' => $message->body, 
+            'attachment' => $message->attachment_url ? [
+                'url' => $message->attachment_url,
+                'name' => $message->attachment_name,
+                'size' => $message->attachment_size,
+                'mime' => $message->attachment_mime
+            ] : null,
+            'created_at' => $message->created_at->toISOString(), 
+            'status' => 'sent'
+        ];
+
+        // Tembak WebSocket!
+        broadcast(new MessageSent($formatted))->toOthers();
+
+        return response()->json($formatted, 201);
+    }
+
+    /**
+     * Tandai sudah dibaca
+     */
+    public function markRead(Request $request, $conversationId) 
+    {
+        $userId = $request->user()->id;
+        Message::where('conversation_id', $conversationId)
+            ->where('sender_id', '!=', $userId)
+            ->where('status', '!=', 'read')
+            ->update(['status' => 'read']);
+
+        broadcast(new MessageStatusUpdated($conversationId, 'read'))->toOthers();
+        return response()->json(['success' => true]);
+    }
+}
