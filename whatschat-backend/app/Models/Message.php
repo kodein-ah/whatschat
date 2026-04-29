@@ -28,6 +28,32 @@ class Message extends Model
     ];
 
     /**
+     * ✅ PERBAIKAN: Append attachment object ke response
+     * React terima 1 property 'attachment' (bukan 4 field terpisah)
+     */
+    protected $appends = ['attachment'];
+
+    /**
+     * ✅ PERBAIKAN: Buat attachment object dari 4 kolom terpisah
+     * Jadi React dapat: { url, name, size, mime }
+     */
+    public function getAttachmentAttribute()
+    {
+        // Jika tidak ada attachment_url, return null
+        if (!$this->attachment_url) {
+            return null;
+        }
+
+        // Gabungkan 4 kolom jadi 1 object
+        return [
+            'url' => $this->attachment_url,
+            'name' => $this->attachment_name ?? 'file',
+            'size' => $this->attachment_size ?? 0,
+            'mime' => $this->attachment_mime ?? 'application/octet-stream',
+        ];
+    }
+
+    /**
      * ✅ Relationship: Sender dari message
      */
     public function sender(): BelongsTo
