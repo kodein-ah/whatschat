@@ -17,12 +17,16 @@ class MessageSent implements ShouldBroadcast
 
     public function __construct($message)
     {
-        // $message di sini adalah ARRAY yang sudah diformat di Controller
+        // ✅ PERBAIKAN: Handle model object (tidak hanya array)
+        // Message model akan otomatis convert ke array via SerializesModels
         $this->message = $message;
     }
 
     public function broadcastOn(): Channel
     {
-        return new PrivateChannel('conversation.' . $this->message['conversation_id']);
+        // ✅ PERBAIKAN: Get conversation_id dari message (works with object atau array)
+        $conversationId = $this->message['conversation_id'] ?? $this->message->conversation_id;
+        
+        return new PrivateChannel('conversation.' . $conversationId);
     }
 }
